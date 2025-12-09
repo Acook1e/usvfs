@@ -1,4 +1,5 @@
 #include "ntdll.h"
+#include "settings.h"
 
 #include <mutex>
 #include <queue>
@@ -1199,6 +1200,8 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
 
   PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
 
+  auto logger = spdlog::get("hooks");
+
   HOOK_START_GROUP(MutExHookGroup::OPEN_FILE)
   if (!callContext.active()) {
     return ::NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
@@ -1209,10 +1212,12 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
   UnicodeString inPath = CreateUnicodeString(ObjectAttributes);
   LPCWSTR inPathW      = static_cast<LPCWSTR>(inPath);
 
+  logger->debug("NtCreateFile: Original path: {0}",
+                ush::string_cast<std::string>(ObjectAttributes->ObjectName->Buffer));
+
   if (inPath.size() == 0) {
-    spdlog::get("hooks")->info(
-        "failed to set from handle: {0}",
-        ush::string_cast<std::string>(ObjectAttributes->ObjectName->Buffer));
+    logger->info("failed to set from handle: {0}",
+                 ush::string_cast<std::string>(ObjectAttributes->ObjectName->Buffer));
     return ::NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
                           AllocationSize, FileAttributes, ShareAccess,
                           CreateDisposition, CreateOptions, EaBuffer, EaLength);
@@ -1245,7 +1250,7 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     convertedDisposition = CREATE_ALWAYS;
     break;
   default:
-    spdlog::get("hooks")->error("invalid disposition: {0}", CreateDisposition);
+    logger->error("invalid disposition: {0}", CreateDisposition);
     break;
   }
 
@@ -1283,8 +1288,128 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
       break;
     }
 
-    RedirectionInfo redir = applyReroute(rerouter);
+    RedirectionInfo redir     = applyReroute(rerouter);
+    std::wstring physicalPath = rerouter.fileName();
+    logger->debug("NtCreateFile: Rerouted path: {0}", physicalPath);
 
+    bool needReroute = false;
+
+    bool isDestructive =
+        (CreateDisposition == FILE_SUPERSEDE || CreateDisposition == FILE_OVERWRITE ||
+         CreateDisposition == FILE_OVERWRITE_IF);
+
+    bool isWrite =
+        (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
+                          FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES)) != 0;
+
+    if (isDestructive)
+      needReroute = true;
+
+    if (isWrite && !needReroute) {
+      bfs::path p(physicalPath);
+      std::string ext = p.extension().string();
+      std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+        return std::tolower(c);
+      });
+
+      static const std::set<std::string> sensitiveExtensions = {
+          ".ini", ".json", ".yaml", ".yml",  ".txt",
+          ".log", ".xml",  ".cfg",  ".conf", ".properties"};
+
+      if (sensitiveExtensions.count(ext))
+        needReroute = true;
+      else
+        logger->warn("NtCreateFile: not rerouting write to non-sensitive file: {0}",
+                     physicalPath);
+    }
+
+    std::wstring overwriteRedirectPath;
+    if (!usvfs::settings::mods_dir.empty() && needReroute) {
+      std::wstring modsDirW = ush::string_cast<std::wstring>(usvfs::settings::mods_dir,
+                                                             ush::CodePage::UTF8);
+      const wchar_t* pathW  = physicalPath.c_str();
+
+      if (physicalPath.size() >= modsDirW.size() &&
+          _wcsnicmp(pathW, modsDirW.c_str(), modsDirW.size()) == 0) {
+        wchar_t nextChar = pathW[modsDirW.size()];
+        if (nextChar == L'\0' || nextChar == L'\\') {
+          bool isExcluded = false;
+          for (const auto& excludedPath : usvfs::settings::exclude_mods) {
+            std::wstring excludedPathW =
+                ush::string_cast<std::wstring>(excludedPath, ush::CodePage::UTF8);
+            if (physicalPath.size() >= excludedPathW.size() &&
+                _wcsnicmp(pathW, excludedPathW.c_str(), excludedPathW.size()) == 0) {
+              wchar_t nextExChar = pathW[excludedPathW.size()];
+              if (nextExChar == L'\0' || nextExChar == L'\\') {
+                isExcluded = true;
+                break;
+              }
+            }
+          }
+
+          if (!isExcluded) {
+            logger->warn("NtCreateFile: mod file can be modified - reroute to: {0}",
+                         physicalPath);
+
+            if (!usvfs::settings::overwrite_dir.empty()) {
+              const wchar_t* relToMods = pathW + modsDirW.size();
+              while (*relToMods == L'\\' || *relToMods == L'/')
+                relToMods++;
+
+              const wchar_t* nextSep      = wcschr(relToMods, L'\\');
+              const wchar_t* nextSepSlash = wcschr(relToMods, L'/');
+              if (nextSepSlash && (!nextSep || nextSepSlash < nextSep))
+                nextSep = nextSepSlash;
+
+              if (nextSep) {
+                const wchar_t* relToModRoot = nextSep + 1;
+                std::wstring overwriteDirW  = ush::string_cast<std::wstring>(
+                    usvfs::settings::overwrite_dir, ush::CodePage::UTF8);
+                bfs::path destPath(overwriteDirW);
+                destPath /= relToModRoot;
+
+                boost::system::error_code ec;
+                bfs::create_directories(destPath.parent_path(), ec);
+                if (!ec) {
+                  if (bfs::exists(destPath, ec)) {
+                    bfs::remove(destPath, ec);
+                  }
+                  bfs::copy_file(physicalPath, destPath, ec);
+
+                  if (ec) {
+                    logger->error("Failed to copy to overwrite: {}", ec.message());
+                  } else {
+                    logger->info("Copied to overwrite: {}", destPath.string());
+                    overwriteRedirectPath = destPath.wstring();
+                  }
+                } else {
+                  logger->error("Failed to create directories for overwrite: {}",
+                                ec.message());
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (!overwriteRedirectPath.empty()) {
+      std::wstring ntPath = LR"(\??\)" + overwriteRedirectPath;
+      redir.path          = UnicodeString(ntPath.c_str());
+      redir.redirected    = true;
+
+      std::wstring lookupPathW = inPathW;
+      if (lookupPathW.rfind(L"\\??\\", 0) == 0 ||
+          lookupPathW.rfind(L"\\\\?\\", 0) == 0) {
+        lookupPathW = lookupPathW.substr(4);
+      }
+      std::string lookupPath =
+          ush::string_cast<std::string>(lookupPathW, ush::CodePage::UTF8);
+      std::string targetPath =
+          ush::string_cast<std::string>(overwriteRedirectPath, ush::CodePage::UTF8);
+
+      WRITE_CONTEXT()->redirectionTable().addFile(lookupPath, targetPath);
+    }
     unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes =
         makeObjectAttributes(redir, ObjectAttributes);
 

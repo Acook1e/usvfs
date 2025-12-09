@@ -20,6 +20,7 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 */
 #include "usvfs.h"
 #include "hookmanager.h"
+#include "hooks/settings.h"
 #include "loghelpers.h"
 #include "redirectiontree.h"
 #include "usvfs_version.h"
@@ -35,6 +36,8 @@ along with usvfs. If not, see <http://www.gnu.org/licenses/>.
 // note that there's a mix of boost and std filesystem stuff in this file and
 // that they're not completely compatible
 #include <filesystem>
+#include <sstream>
+#include <vector>
 
 namespace bfs = boost::filesystem;
 namespace ush = usvfs::shared;
@@ -371,11 +374,134 @@ LONG WINAPI VEHandler(PEXCEPTION_POINTERS exceptionPtrs)
 // Exported functions
 //
 
+void LoadSettings()
+{
+  wchar_t modulePath[MAX_PATH];
+  if (GetModuleFileNameW(dllModule, modulePath, MAX_PATH) == 0) {
+    return;
+  }
+  std::wstring iniPath = modulePath;
+  size_t lastSlash     = iniPath.find_last_of(L"\\/");
+  if (lastSlash != std::wstring::npos) {
+    iniPath = iniPath.substr(0, lastSlash + 1);
+  } else {
+    iniPath = L"";
+  }
+  iniPath += L"usvfs_redirect.ini";
+
+  std::filesystem::path dllDir = std::filesystem::path(modulePath).parent_path();
+
+  auto makeAbsolute = [&](std::string pathStr) -> std::string {
+    if (pathStr.empty())
+      return "";
+    std::filesystem::path p =
+        ush::string_cast<std::wstring>(pathStr, ush::CodePage::UTF8);
+    if (p.is_relative()) {
+      p = dllDir / p;
+    }
+    return ush::string_cast<std::string>(p.lexically_normal().wstring(),
+                                         ush::CodePage::UTF8);
+  };
+
+  // Helper to read string and convert to UTF-8
+  auto readString = [&](const wchar_t* section, const wchar_t* key,
+                        const wchar_t* def) {
+    wchar_t buffer[4096];
+    GetPrivateProfileStringW(section, key, def, buffer, 4096, iniPath.c_str());
+    return ush::string_cast<std::string>(buffer, ush::CodePage::UTF8);
+  };
+
+  usvfs::settings::mods_dir = makeAbsolute(readString(L"General", L"mods_dir", L""));
+  usvfs::settings::overwrite_dir =
+      makeAbsolute(readString(L"General", L"overwrite_dir", L""));
+
+  std::string exclude_raw = readString(L"General", L"exclude_dir", L"");
+  usvfs::settings::exclude_mods.clear();
+  if (!exclude_raw.empty()) {
+    std::stringstream ss(exclude_raw);
+    std::string item;
+    while (std::getline(ss, item, ';')) {
+      if (!item.empty()) {
+        std::filesystem::path p =
+            ush::string_cast<std::wstring>(item, ush::CodePage::UTF8);
+        if (p.is_relative() && !usvfs::settings::mods_dir.empty()) {
+          std::filesystem::path mods = ush::string_cast<std::wstring>(
+              usvfs::settings::mods_dir, ush::CodePage::UTF8);
+          p = mods / p;
+        } else if (p.is_relative()) {
+          p = std::filesystem::path(
+              ush::string_cast<std::wstring>(makeAbsolute(item), ush::CodePage::UTF8));
+        }
+        usvfs::settings::exclude_mods.push_back(ush::string_cast<std::string>(
+            p.lexically_normal().wstring(), ush::CodePage::UTF8));
+      }
+    }
+  }
+
+  // Read Output section
+  wchar_t buffer[32768];  // 32KB is max for GetPrivateProfileSection
+  if (GetPrivateProfileSectionW(L"Output", buffer, 32768, iniPath.c_str()) > 0) {
+    wchar_t* p = buffer;
+    while (*p) {
+      std::wstring line = p;
+      size_t eq         = line.find(L'=');
+      if (eq != std::wstring::npos) {
+        std::wstring key = line.substr(0, eq);
+        std::wstring val = line.substr(eq + 1);
+        usvfs::settings::output_directories[ush::string_cast<std::string>(
+            key, ush::CodePage::UTF8)] =
+            ush::string_cast<std::string>(val, ush::CodePage::UTF8);
+      }
+      p += line.length() + 1;
+    }
+  }
+
+  if (!usvfs::settings::current_process.empty()) {
+    auto it =
+        usvfs::settings::output_directories.find(usvfs::settings::current_process);
+    if (it != usvfs::settings::output_directories.end()) {
+      std::string relativeOverwrite = it->second;
+      if (!usvfs::settings::mods_dir.empty()) {
+        std::filesystem::path mods(ush::string_cast<std::wstring>(
+            usvfs::settings::mods_dir, ush::CodePage::UTF8));
+        std::filesystem::path rel(
+            ush::string_cast<std::wstring>(relativeOverwrite, ush::CodePage::UTF8));
+        std::filesystem::path newOverwrite = mods / rel;
+        usvfs::settings::overwrite_dir     = ush::string_cast<std::string>(
+            newOverwrite.lexically_normal().wstring(), ush::CodePage::UTF8);
+
+        auto logger = spdlog::get("usvfs");
+        if (logger) {
+          logger->info("Instance match: '{}' -> Overwrite set to: '{}'",
+                       usvfs::settings::current_process,
+                       usvfs::settings::overwrite_dir);
+        }
+      }
+    }
+  }
+
+  auto logger = spdlog::get("usvfs");
+  logger->info("Settings loaded:");
+  logger->info("  mods_dir: {}", usvfs::settings::mods_dir);
+  logger->info("  overwrite_dir: {}", usvfs::settings::overwrite_dir);
+  logger->info("  exclude_mods:");
+  for (const auto& dir : usvfs::settings::exclude_mods) {
+    logger->info("    - {}", dir);
+  }
+  logger->info("  output_directories:");
+  for (const auto& [exe, dir] : usvfs::settings::output_directories) {
+    logger->info("    - {} -> {}", exe, dir);
+  }
+}
+
 void __cdecl InitHooks(LPVOID parameters, size_t)
 {
   InitLoggingInternal(false, true);
 
   const usvfsParameters* params = reinterpret_cast<usvfsParameters*>(parameters);
+
+  usvfs::settings::current_process = "SkyrimSE.exe";
+  LoadSettings();
 
   // there is already a wait in the constructor of HookManager, but this one is useful
   // to debug code here (from experience... ), should not wait twice since the second
