@@ -54,4 +54,16 @@ DLLEXPORT NTSTATUS WINAPI hook_NtClose(HANDLE Handle);
 DLLEXPORT NTSTATUS WINAPI hook_NtTerminateProcess(HANDLE ProcessHandle,
                                                   NTSTATUS ExitStatus);
 
+DLLEXPORT NTSTATUS WINAPI hook_NtReadFile(HANDLE FileHandle, HANDLE Event,
+                                          PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+                                          PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
+                                          ULONG Length, PLARGE_INTEGER ByteOffset,
+                                          PULONG Key);
+
+DLLEXPORT NTSTATUS WINAPI hook_NtWriteFile(HANDLE FileHandle, HANDLE Event,
+                                           PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+                                           PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
+                                           ULONG Length, PLARGE_INTEGER ByteOffset,
+                                           PULONG Key);
+
 }  // namespace usvfs

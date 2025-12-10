@@ -1144,6 +1144,62 @@ NTSTATUS ntdll_mess_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     unique_ptr_deleter<OBJECT_ATTRIBUTES> adjustedAttributes =
         makeObjectAttributes(redir, ObjectAttributes);
 
+    auto logger = spdlog::get("hooks");
+
+    bool isWrite =
+        (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
+                          FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES)) != 0;
+    if (isWrite) {
+      std::wstring physicalPath = adjustedAttributes->ObjectName->Buffer;
+
+      // Clean up NT path prefix if present
+      if (physicalPath.rfind(L"\\??\\", 0) == 0 ||
+          physicalPath.rfind(L"\\\\?\\", 0) == 0) {
+        physicalPath = physicalPath.substr(4);
+      }
+
+      // Check if file is in mods directory
+      bool isInModsDir = false;
+      std::wstring modsDirW;
+      if (!usvfs::settings::mods_dir.empty()) {
+        modsDirW = ush::string_cast<std::wstring>(usvfs::settings::mods_dir,
+                                                  ush::CodePage::UTF8);
+        if (physicalPath.size() >= modsDirW.size() &&
+            _wcsnicmp(physicalPath.c_str(), modsDirW.c_str(), modsDirW.size()) == 0) {
+          wchar_t nextChar = physicalPath.c_str()[modsDirW.size()];
+          if (nextChar == L'\0' || nextChar == L'\\') {
+            isInModsDir = true;
+          }
+        }
+      }
+
+      // Check if file is in excluded directory
+      bool isExcluded = false;
+      if (isInModsDir) {
+        for (const auto& excludedPath : usvfs::settings::exclude_mods) {
+          std::wstring excludedPathW =
+              ush::string_cast<std::wstring>(excludedPath, ush::CodePage::UTF8);
+          if (physicalPath.size() >= excludedPathW.size() &&
+              _wcsnicmp(physicalPath.c_str(), excludedPathW.c_str(),
+                        excludedPathW.size()) == 0) {
+            wchar_t nextExChar = physicalPath.c_str()[excludedPathW.size()];
+            if (nextExChar == L'\0' || nextExChar == L'\\') {
+              isExcluded = true;
+              break;
+            }
+          }
+        }
+      }
+
+      // Only track for CoW if in mods directory and not excluded
+      if (isInModsDir && !isExcluded) {
+        logger->debug("NtOpenFile: write access detected for file: {}",
+                      ush::string_cast<std::string>(physicalPath, ush::CodePage::UTF8));
+        WRITE_CONTEXT()->customData<WriteAccessHandleMap>(
+            WriteAccessHandles)[*FileHandle] = {nullptr, physicalPath};
+      }
+    }
+
     PRE_REALCALL
     res = ::NtOpenFile(FileHandle, DesiredAccess, adjustedAttributes.get(),
                        IoStatusBlock, ShareAccess, OpenOptions);
@@ -1216,7 +1272,7 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
                 ush::string_cast<std::string>(ObjectAttributes->ObjectName->Buffer));
 
   if (inPath.size() == 0) {
-    logger->info("failed to set from handle: {0}",
+    logger->info("NtCreateFile: failed to set from handle: {0}",
                  ush::string_cast<std::string>(ObjectAttributes->ObjectName->Buffer));
     return ::NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
                           AllocationSize, FileAttributes, ShareAccess,
@@ -1250,7 +1306,7 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     convertedDisposition = CREATE_ALWAYS;
     break;
   default:
-    logger->error("invalid disposition: {0}", CreateDisposition);
+    logger->error("NtCreateFile: invalid disposition: {0}", CreateDisposition);
     break;
   }
 
@@ -1290,9 +1346,15 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
 
     RedirectionInfo redir     = applyReroute(rerouter);
     std::wstring physicalPath = rerouter.fileName();
-    logger->debug("NtCreateFile: Rerouted path: {0}", physicalPath);
 
-    bool needReroute = false;
+    // Clean up NT path prefix if present
+    if (physicalPath.rfind(L"\\??\\", 0) == 0 ||
+        physicalPath.rfind(L"\\\\?\\", 0) == 0) {
+      physicalPath = physicalPath.substr(4);
+    }
+
+    logger->debug("NtCreateFile: Rerouted path: {}",
+                  ush::string_cast<std::string>(physicalPath, ush::CodePage::UTF8));
 
     bool isDestructive =
         (CreateDisposition == FILE_SUPERSEDE || CreateDisposition == FILE_OVERWRITE ||
@@ -1302,95 +1364,110 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
         (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
                           FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES)) != 0;
 
-    if (isDestructive)
-      needReroute = true;
-
-    if (isWrite && !needReroute) {
-      bfs::path p(physicalPath);
-      std::string ext = p.extension().string();
-      std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
-        return std::tolower(c);
-      });
-
-      static const std::set<std::string> sensitiveExtensions = {
-          ".ini", ".json", ".yaml", ".yml",  ".txt",
-          ".log", ".xml",  ".cfg",  ".conf", ".properties"};
-
-      if (sensitiveExtensions.count(ext))
-        needReroute = true;
-      else
-        logger->warn("NtCreateFile: not rerouting write to non-sensitive file: {0}",
-                     physicalPath);
-    }
+    logger->debug("NtCreateFile: isWrite: {}, isDestructive: {}", isWrite,
+                  isDestructive);
 
     std::wstring overwriteRedirectPath;
-    if (!usvfs::settings::mods_dir.empty() && needReroute) {
-      std::wstring modsDirW = ush::string_cast<std::wstring>(usvfs::settings::mods_dir,
-                                                             ush::CodePage::UTF8);
-      const wchar_t* pathW  = physicalPath.c_str();
 
+    // Check if file is in mods directory
+    bool isInModsDir = false;
+    std::wstring modsDirW;
+    if (!usvfs::settings::mods_dir.empty() && (isDestructive || isWrite)) {
+      modsDirW = ush::string_cast<std::wstring>(usvfs::settings::mods_dir,
+                                                ush::CodePage::UTF8);
       if (physicalPath.size() >= modsDirW.size() &&
-          _wcsnicmp(pathW, modsDirW.c_str(), modsDirW.size()) == 0) {
-        wchar_t nextChar = pathW[modsDirW.size()];
+          _wcsnicmp(physicalPath.c_str(), modsDirW.c_str(), modsDirW.size()) == 0) {
+        wchar_t nextChar = physicalPath.c_str()[modsDirW.size()];
         if (nextChar == L'\0' || nextChar == L'\\') {
-          bool isExcluded = false;
-          for (const auto& excludedPath : usvfs::settings::exclude_mods) {
-            std::wstring excludedPathW =
-                ush::string_cast<std::wstring>(excludedPath, ush::CodePage::UTF8);
-            if (physicalPath.size() >= excludedPathW.size() &&
-                _wcsnicmp(pathW, excludedPathW.c_str(), excludedPathW.size()) == 0) {
-              wchar_t nextExChar = pathW[excludedPathW.size()];
-              if (nextExChar == L'\0' || nextExChar == L'\\') {
-                isExcluded = true;
-                break;
-              }
-            }
-          }
+          isInModsDir = true;
+        }
+      }
+    }
 
-          if (!isExcluded) {
-            logger->warn("NtCreateFile: mod file can be modified - reroute to: {0}",
-                         physicalPath);
-
-            if (!usvfs::settings::overwrite_dir.empty()) {
-              const wchar_t* relToMods = pathW + modsDirW.size();
-              while (*relToMods == L'\\' || *relToMods == L'/')
-                relToMods++;
-
-              const wchar_t* nextSep      = wcschr(relToMods, L'\\');
-              const wchar_t* nextSepSlash = wcschr(relToMods, L'/');
-              if (nextSepSlash && (!nextSep || nextSepSlash < nextSep))
-                nextSep = nextSepSlash;
-
-              if (nextSep) {
-                const wchar_t* relToModRoot = nextSep + 1;
-                std::wstring overwriteDirW  = ush::string_cast<std::wstring>(
-                    usvfs::settings::overwrite_dir, ush::CodePage::UTF8);
-                bfs::path destPath(overwriteDirW);
-                destPath /= relToModRoot;
-
-                boost::system::error_code ec;
-                bfs::create_directories(destPath.parent_path(), ec);
-                if (!ec) {
-                  if (bfs::exists(destPath, ec)) {
-                    bfs::remove(destPath, ec);
-                  }
-                  bfs::copy_file(physicalPath, destPath, ec);
-
-                  if (ec) {
-                    logger->error("Failed to copy to overwrite: {}", ec.message());
-                  } else {
-                    logger->info("Copied to overwrite: {}", destPath.string());
-                    overwriteRedirectPath = destPath.wstring();
-                  }
-                } else {
-                  logger->error("Failed to create directories for overwrite: {}",
-                                ec.message());
-                }
-              }
-            }
+    // Check if file is in excluded directory
+    bool isExcluded = false;
+    if (isInModsDir) {
+      for (const auto& excludedPath : usvfs::settings::exclude_mods) {
+        std::wstring excludedPathW =
+            ush::string_cast<std::wstring>(excludedPath, ush::CodePage::UTF8);
+        if (physicalPath.size() >= excludedPathW.size() &&
+            _wcsnicmp(physicalPath.c_str(), excludedPathW.c_str(),
+                      excludedPathW.size()) == 0) {
+          wchar_t nextExChar = physicalPath.c_str()[excludedPathW.size()];
+          if (nextExChar == L'\0' || nextExChar == L'\\') {
+            isExcluded = true;
+            logger->debug(
+                "NtCreateFile: File is in excluded directory: {}",
+                ush::string_cast<std::string>(excludedPathW, ush::CodePage::UTF8));
+            break;
           }
         }
       }
+    }
+
+    logger->debug("NtCreateFile: isInModsDir: {}, isExcluded: {}", isInModsDir,
+                  isExcluded);
+
+    // Handle destructive operations on mods files
+    if (isInModsDir && !isExcluded && isDestructive) {
+      logger->warn("NtCreateFile: mod file will be truncated - original path: {}",
+                   ush::string_cast<std::string>(physicalPath, ush::CodePage::UTF8));
+
+      if (!usvfs::settings::overwrite_dir.empty()) {
+        const wchar_t* relToMods = physicalPath.c_str() + modsDirW.size();
+        while (*relToMods == L'\\' || *relToMods == L'/')
+          relToMods++;
+
+        const wchar_t* nextSep      = wcschr(relToMods, L'\\');
+        const wchar_t* nextSepSlash = wcschr(relToMods, L'/');
+        if (nextSepSlash && (!nextSep || nextSepSlash < nextSep))
+          nextSep = nextSepSlash;
+
+        if (nextSep) {
+          const wchar_t* relToModRoot = nextSep + 1;
+          std::wstring overwriteDirW  = ush::string_cast<std::wstring>(
+              usvfs::settings::overwrite_dir, ush::CodePage::UTF8);
+          bfs::path destPath(overwriteDirW);
+          destPath /= relToModRoot;
+
+          boost::system::error_code ec;
+          bfs::create_directories(destPath.parent_path(), ec);
+          if (!ec) {
+            if (bfs::exists(destPath, ec)) {
+              bfs::remove(destPath, ec);
+            }
+            bfs::copy_file(physicalPath, destPath, ec);
+
+            if (ec) {
+              logger->error(
+                  "NtCreateFile: Failed to copy to overwrite: {} (source: {}, dest: "
+                  "{})",
+                  ush::string_cast<std::string>(
+                      ush::string_cast<std::wstring>(ec.message(), ush::CodePage::UTF8),
+                      ush::CodePage::UTF8),
+                  ush::string_cast<std::string>(physicalPath, ush::CodePage::UTF8),
+                  destPath.string());
+            } else {
+              logger->info("NtCreateFile: Copied to overwrite: {}", destPath.string());
+              overwriteRedirectPath = destPath.wstring();
+            }
+          } else {
+            logger->error(
+                "NtCreateFile: Failed to create directories for overwrite: {} (dest: "
+                "{})",
+                ush::string_cast<std::string>(
+                    ush::string_cast<std::wstring>(ec.message(), ush::CodePage::UTF8),
+                    ush::CodePage::UTF8),
+                ush::string_cast<std::string>(overwriteDirW, ush::CodePage::UTF8));
+          }
+        }
+      }
+    } else if (isInModsDir && !isExcluded && isWrite) {
+      // File is in mods directory and has write access, prepare for CoW
+      logger->debug("NtCreateFile: write access detected for file: {}",
+                    ush::string_cast<std::string>(physicalPath, ush::CodePage::UTF8));
+      WRITE_CONTEXT()->customData<WriteAccessHandleMap>(
+          WriteAccessHandles)[*FileHandle] = {nullptr, physicalPath};
     }
 
     if (!overwriteRedirectPath.empty()) {
@@ -1516,6 +1593,15 @@ NTSTATUS WINAPI usvfs::hook_NtClose(HANDLE Handle)
     }
   }
 
+  WriteAccessHandleMap& writeAccessHandles =
+      WRITE_CONTEXT()->customData<WriteAccessHandleMap>(WriteAccessHandles);
+  auto writeIter = writeAccessHandles.find(Handle);
+  if (writeIter != writeAccessHandles.end()) {
+    if (writeIter->second.RerouteHandle != nullptr)
+      ::CloseHandle(writeIter->second.RerouteHandle);
+    writeAccessHandles.erase(writeIter);
+  }
+
   if (GetFileType(Handle) == FILE_TYPE_DISK)
     ntdllHandleTracker.erase(Handle);
 
@@ -1639,6 +1725,189 @@ NTSTATUS WINAPI usvfs::hook_NtTerminateProcess(HANDLE ProcessHandle,
 
   res = ::NtTerminateProcess(ProcessHandle, ExitStatus);
 
+  HOOK_END
+
+  return res;
+}
+
+NTSTATUS WINAPI usvfs::hook_NtReadFile(HANDLE FileHandle, HANDLE Event,
+                                       PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+                                       PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
+                                       ULONG Length, PLARGE_INTEGER ByteOffset,
+                                       PULONG Key)
+{
+  using namespace usvfs;
+
+  NTSTATUS res = STATUS_SUCCESS;
+
+  PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
+
+  auto logger = spdlog::get("hooks");
+
+  HOOK_START_GROUP(MutExHookGroup::NO_GROUP)
+  if (!callContext.active()) {
+    return ::NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                        Buffer, Length, ByteOffset, Key);
+  }
+
+  auto& writeAccessMap =
+      READ_CONTEXT()->customData<WriteAccessHandleMap>(WriteAccessHandles);
+
+  auto writeIter = writeAccessMap.find(FileHandle);
+  if (writeIter != writeAccessMap.end()) {
+    if (writeIter->second.RerouteHandle != nullptr) {
+      // File has been copied, read from the rerouted file
+      logger->debug("NtReadFile: Reading from rerouted file: {}",
+                    writeIter->second.ReroutePath);
+      PRE_REALCALL
+      res = ::NtReadFile(writeIter->second.RerouteHandle, Event, ApcRoutine, ApcContext,
+                         IoStatusBlock, Buffer, Length, ByteOffset, Key);
+      POST_REALCALL
+    } else {
+      // File is in CoW state but not yet copied, read from original file
+      logger->debug("NtReadFile: Reading from original file (CoW pending): {}",
+                    writeIter->second.ReroutePath);
+      PRE_REALCALL
+      res = ::NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                         Buffer, Length, ByteOffset, Key);
+      POST_REALCALL
+    }
+  } else {
+    // File not in write access map, read normally
+    PRE_REALCALL
+    res = ::NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, Buffer,
+                       Length, ByteOffset, Key);
+    POST_REALCALL
+  }
+  HOOK_END
+
+  return res;
+}
+
+NTSTATUS WINAPI usvfs::hook_NtWriteFile(HANDLE FileHandle, HANDLE Event,
+                                        PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+                                        PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
+                                        ULONG Length, PLARGE_INTEGER ByteOffset,
+                                        PULONG Key)
+{
+  using namespace usvfs;
+
+  NTSTATUS res = STATUS_ACCESS_DENIED;
+
+  PreserveGetLastError ntFunctionsDoNotChangeGetLastError;
+
+  auto logger = spdlog::get("hooks");
+
+  HOOK_START_GROUP(MutExHookGroup::ALL_GROUPS)
+  if (!callContext.active()) {
+    return ::NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                         Buffer, Length, ByteOffset, Key);
+  }
+
+  auto& writeAccessMap =
+      READ_CONTEXT()->customData<WriteAccessHandleMap>(WriteAccessHandles);
+
+  auto writeIter = writeAccessMap.find(FileHandle);
+  if (writeIter != writeAccessMap.end()) {
+    // handle write access
+    WriteAccessHandle& writeAccessInfo = writeIter->second;
+    if (writeAccessInfo.RerouteHandle != nullptr) {
+      logger->debug("NtWriteFile: Write operation detected for file: {}",
+                    writeAccessInfo.ReroutePath);
+      PRE_REALCALL
+      res = ::NtWriteFile(writeAccessInfo.RerouteHandle, Event, ApcRoutine, ApcContext,
+                          IoStatusBlock, Buffer, Length, ByteOffset, Key);
+      POST_REALCALL
+    } else if (writeAccessInfo.RerouteHandle == nullptr) {
+      logger->info("NtWriteFile: Copy on Write for file: {}",
+                   writeAccessInfo.ReroutePath);
+
+      // CoW: Copy the original file to the reroute path first
+      std::wstring reroutePath = writeAccessInfo.ReroutePath;
+      if (!usvfs::settings::overwrite_dir.empty()) {
+        std::wstring overwriteDirW = ush::string_cast<std::wstring>(
+            usvfs::settings::overwrite_dir, ush::CodePage::UTF8);
+
+        // Extract the relative path from the mods directory
+        std::wstring modsDirW = ush::string_cast<std::wstring>(
+            usvfs::settings::mods_dir, ush::CodePage::UTF8);
+        const wchar_t* pathW = writeAccessInfo.ReroutePath.c_str();
+
+        if (writeAccessInfo.ReroutePath.size() >= modsDirW.size() &&
+            _wcsnicmp(pathW, modsDirW.c_str(), modsDirW.size()) == 0) {
+          const wchar_t* relToMods = pathW + modsDirW.size();
+          while (*relToMods == L'\\' || *relToMods == L'/')
+            relToMods++;
+
+          const wchar_t* nextSep      = wcschr(relToMods, L'\\');
+          const wchar_t* nextSepSlash = wcschr(relToMods, L'/');
+          if (nextSepSlash && (!nextSep || nextSepSlash < nextSep))
+            nextSep = nextSepSlash;
+
+          if (nextSep) {
+            const wchar_t* relToModRoot = nextSep + 1;
+            bfs::path destPath(overwriteDirW);
+            destPath /= relToModRoot;
+
+            boost::system::error_code ec;
+            bfs::create_directories(destPath.parent_path(), ec);
+            if (!ec) {
+              if (bfs::exists(destPath, ec)) {
+                bfs::remove(destPath, ec);
+              }
+              bfs::copy_file(writeAccessInfo.ReroutePath, destPath, ec);
+
+              if (!ec) {
+                logger->info("NtWriteFile: CoW - Copied file to overwrite: {}",
+                             destPath.string());
+                reroutePath = destPath.wstring();
+
+                // Open the rerouted file for writing
+                HANDLE rerouteHandle =
+                    CreateFileW(reroutePath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+                if (rerouteHandle != INVALID_HANDLE_VALUE) {
+                  writeAccessInfo.RerouteHandle = rerouteHandle;
+                  writeAccessInfo.ReroutePath   = reroutePath;
+                  PRE_REALCALL
+                  res = ::NtWriteFile(rerouteHandle, Event, ApcRoutine, ApcContext,
+                                      IoStatusBlock, Buffer, Length, ByteOffset, Key);
+                  POST_REALCALL
+                } else {
+                  logger->error("NtWriteFile: CoW - Failed to open rerouted file: {}",
+                                reroutePath);
+                  res = STATUS_CANNOT_DELETE;
+                }
+              } else {
+                logger->error("NtWriteFile: CoW - Failed to copy file: {}",
+                              ec.message());
+                res = STATUS_CANNOT_DELETE;
+              }
+            } else {
+              logger->error("NtWriteFile: CoW - Failed to create directories: {}",
+                            ec.message());
+              res = STATUS_CANNOT_DELETE;
+            }
+          } else {
+            logger->warn("NtWriteFile: CoW - Could not determine relative path");
+            res = STATUS_INVALID_PARAMETER;
+          }
+        } else {
+          logger->warn("NtWriteFile: CoW - File not in mods directory");
+          res = STATUS_INVALID_PARAMETER;
+        }
+      } else {
+        logger->warn("NtWriteFile: CoW - overwrite_dir not configured");
+        res = STATUS_INVALID_PARAMETER;
+      }
+    }
+  } else {
+    PRE_REALCALL
+    res = ::NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                        Buffer, Length, ByteOffset, Key);
+    POST_REALCALL
+  }
   HOOK_END
 
   return res;

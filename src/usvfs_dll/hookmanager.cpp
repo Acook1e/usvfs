@@ -302,6 +302,8 @@ void HookManager::initHooks()
   installHook(ntdllMod, nullptr, "NtCreateFile", hook_NtCreateFile);
   installHook(ntdllMod, nullptr, "NtClose", hook_NtClose);
   installHook(ntdllMod, nullptr, "NtTerminateProcess", hook_NtTerminateProcess);
+  installHook(ntdllMod, nullptr, "NtReadFile", hook_NtReadFile);
+  installHook(ntdllMod, nullptr, "NtWriteFile", hook_NtWriteFile);
 
   installHook(kbaseMod, k32Mod, "LoadLibraryExA", hook_LoadLibraryExA);
   installHook(kbaseMod, k32Mod, "LoadLibraryExW", hook_LoadLibraryExW);

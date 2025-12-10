@@ -41,6 +41,8 @@ RtlDosPathNameToRelativeNtPathName_U_WithStatus_type
 RtlReleaseRelativeName_type RtlReleaseRelativeName;
 RtlGetVersion_type RtlGetVersion;
 NtTerminateProcess_type NtTerminateProcess;
+NtReadFile_type NtReadFile;
+NtWriteFile_type NtWriteFile;
 
 static bool ntdll_initialized;
 
@@ -64,6 +66,8 @@ void ntdll_declarations_init()
     LOAD_EXT(ntDLLMod, RtlReleaseRelativeName);
     LOAD_EXT(ntDLLMod, RtlGetVersion);
     LOAD_EXT(ntDLLMod, NtTerminateProcess);
+    LOAD_EXT(ntDLLMod, NtReadFile);
+    LOAD_EXT(ntDLLMod, NtWriteFile);
 
     ntdll_initialized = true;
   }

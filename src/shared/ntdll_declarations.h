@@ -358,6 +358,8 @@ typedef struct _FILE_REPARSE_POINT_INFORMATION
 #define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006L)
 #define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
 #define STATUS_NO_SUCH_FILE ((NTSTATUS)0xC000000FL)
+#define STATUS_ACCESS_DENIED ((NTSTATUS)0xC0000022L)
+#define STATUS_CANNOT_DELETE ((NTSTATUS)0xC0000121L)
 
 #define SL_RESTART_SCAN 0x01
 #define SL_RETURN_SINGLE_ENTRY 0x02
@@ -579,6 +581,18 @@ using NtClose_type = NTSTATUS(WINAPI*)(HANDLE);
 using NtTerminateProcess_type = NTSTATUS(WINAPI*)(HANDLE ProcessHandle,
                                                   NTSTATUS ExitStatus);
 
+using NtReadFile_type = NTSTATUS(WINAPI*)(HANDLE FileHandle, HANDLE Event,
+                                          PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+                                          PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
+                                          ULONG Length, PLARGE_INTEGER ByteOffset,
+                                          PULONG Key);
+
+using NtWriteFile_type = NTSTATUS(WINAPI*)(HANDLE FileHandle, HANDLE Event,
+                                           PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+                                           PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
+                                           ULONG Length, PLARGE_INTEGER ByteOffset,
+                                           PULONG Key);
+
 // Rtl
 
 using RtlDoesFileExists_U_type = NTSYSAPI BOOLEAN(NTAPI*)(PCWSTR);
@@ -599,6 +613,9 @@ extern NtOpenFile_type NtOpenFile;
 extern NtCreateFile_type NtCreateFile;
 extern NtClose_type NtClose;
 extern NtTerminateProcess_type NtTerminateProcess;
+extern NtReadFile_type NtReadFile;
+extern NtWriteFile_type NtWriteFile;
+
 extern RtlDoesFileExists_U_type RtlDoesFileExists_U;
 extern RtlDosPathNameToRelativeNtPathName_U_WithStatus_type
     RtlDosPathNameToRelativeNtPathName_U_WithStatus;
