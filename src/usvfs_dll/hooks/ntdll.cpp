@@ -1744,7 +1744,7 @@ NTSTATUS WINAPI usvfs::hook_NtReadFile(HANDLE FileHandle, HANDLE Event,
 
   auto logger = spdlog::get("hooks");
 
-  HOOK_START_GROUP(MutExHookGroup::NO_GROUP)
+  HOOK_START
   if (!callContext.active()) {
     return ::NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                         Buffer, Length, ByteOffset, Key);
