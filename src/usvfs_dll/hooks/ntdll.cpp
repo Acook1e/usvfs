@@ -950,10 +950,22 @@ DLLEXPORT NTSTATUS WINAPI usvfs::hook_NtQueryInformationFile(
                                     FileInformationClass);
   }
 
-  PRE_REALCALL
-  res = ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
-                                 FileInformationClass);
-  POST_REALCALL
+  auto& writeAccessMap =
+      READ_CONTEXT()->customData<WriteAccessHandleMap>(WriteAccessHandles);
+  auto WriteIter = writeAccessMap.find(FileHandle);
+  if (WriteIter != writeAccessMap.end() &&
+      WriteIter->second.RerouteHandle != INVALID_HANDLE_VALUE) {
+    auto WriteInfo = WriteIter->second;
+    PRE_REALCALL
+    res = ::NtQueryInformationFile(WriteInfo.RerouteHandle, IoStatusBlock,
+                                   FileInformation, Length, FileInformationClass);
+    POST_REALCALL
+  } else {
+    PRE_REALCALL
+    res = ::NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+                                   FileInformationClass);
+    POST_REALCALL
+  }
 
   // we handle both SUCCESS and BUFFER_OVERFLOW since the fixed name might be
   // smaller than the original one
@@ -970,8 +982,13 @@ DLLEXPORT NTSTATUS WINAPI usvfs::hook_NtQueryInformationFile(
         FileInformationClass == FileNormalizedNameInformation)) ||
       (res == STATUS_SUCCESS && FileInformationClass == FileAllInformation)) {
 
-    const auto trackerInfo = ntdllHandleTracker.lookup(FileHandle);
-    const auto redir       = applyReroute(READ_CONTEXT(), callContext, trackerInfo);
+    HandleTracker::info_type trackerInfo;
+    if (WriteIter != writeAccessMap.end() &&
+        WriteIter->second.RerouteHandle != INVALID_HANDLE_VALUE)
+      trackerInfo = ntdllHandleTracker.lookup(WriteIter->second.RerouteHandle);
+    else
+      trackerInfo = ntdllHandleTracker.lookup(FileHandle);
+    const auto redir = applyReroute(READ_CONTEXT(), callContext, trackerInfo);
 
     // TODO: difference between FileNameInformation and FileNormalizedNameInformation
 
@@ -1024,6 +1041,42 @@ DLLEXPORT NTSTATUS WINAPI usvfs::hook_NtQueryInformationFile(
                                    ? std::wstring{info->FileName,
                                                   info->FileNameLength / sizeof(WCHAR)}
                                    : std::wstring{});
+  }
+
+  HOOK_END
+  return res;
+}
+
+DLLEXPORT NTSTATUS WINAPI usvfs::hook_NtSetInformationFile(
+    HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation,
+    ULONG Length, FILE_INFORMATION_CLASS FileInformationClass)
+{
+  NTSTATUS res = STATUS_SUCCESS;
+
+  HOOK_START_GROUP(MutExHookGroup::FILE_ATTRIBUTES)
+
+  if (!callContext.active()) {
+    res = ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+                                 FileInformationClass);
+    callContext.updateLastError();
+    return res;
+  }
+
+  auto& writeAccessMap =
+      READ_CONTEXT()->customData<WriteAccessHandleMap>(WriteAccessHandles);
+  auto WriteIter = writeAccessMap.find(FileHandle);
+  if (WriteIter != writeAccessMap.end() &&
+      WriteIter->second.RerouteHandle != INVALID_HANDLE_VALUE) {
+    auto WriteInfo = WriteIter->second;
+    PRE_REALCALL
+    res = ::NtSetInformationFile(WriteInfo.RerouteHandle, IoStatusBlock,
+                                 FileInformation, Length, FileInformationClass);
+    POST_REALCALL
+  } else {
+    PRE_REALCALL
+    res = ::NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+                                 FileInformationClass);
+    POST_REALCALL
   }
 
   HOOK_END
@@ -1146,11 +1199,11 @@ NTSTATUS ntdll_mess_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
 
     auto logger = spdlog::get("hooks");
 
-    bool isWrite =
-        (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
-                          FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES)) != 0;
-    if (isWrite) {
-      std::wstring physicalPath = adjustedAttributes->ObjectName->Buffer;
+    bool needReroute = false;
+    std::wstring physicalPath;
+    if ((DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
+                          FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES)) != 0) {
+      physicalPath = adjustedAttributes->ObjectName->Buffer;
 
       // Clean up NT path prefix if present
       if (physicalPath.rfind(L"\\??\\", 0) == 0 ||
@@ -1192,12 +1245,8 @@ NTSTATUS ntdll_mess_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
       }
 
       // Only track for CoW if in mods directory and not excluded
-      if (isInModsDir && !isExcluded) {
-        logger->debug("NtOpenFile: write access detected for file: {}",
-                      ush::string_cast<std::string>(physicalPath, ush::CodePage::UTF8));
-        WRITE_CONTEXT()->customData<WriteAccessHandleMap>(
-            WriteAccessHandles)[*FileHandle] = {nullptr, physicalPath};
-      }
+      if (isInModsDir && !isExcluded)
+        needReroute = true;
     }
 
     PRE_REALCALL
@@ -1209,6 +1258,13 @@ NTSTATUS ntdll_mess_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
       READ_CONTEXT()->customData<SearchHandleMap>(SearchHandles)[*FileHandle] =
           static_cast<LPCWSTR>(fullName);
 #pragma message("need to clean up this handle in CloseHandle call")
+    }
+
+    if (needReroute) {
+      logger->debug("NtOpenFile: write access detected for file: {}",
+                    ush::string_cast<std::string>(physicalPath, ush::CodePage::UTF8));
+      WRITE_CONTEXT()->customData<WriteAccessHandleMap>(
+          WriteAccessHandles)[*FileHandle] = {nullptr, physicalPath};
     }
 
     if (redir.redirected) {
@@ -1442,9 +1498,9 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
               logger->error(
                   "NtCreateFile: Failed to copy to overwrite: {} (source: {}, dest: "
                   "{})",
-                  ush::string_cast<std::string>(
-                      ush::string_cast<std::wstring>(ec.message(), ush::CodePage::UTF8),
-                      ush::CodePage::UTF8),
+                  ush::string_cast<std::string>(ush::string_cast<std::wstring>(
+                                                    ec.message(), ush::CodePage::LOCAL),
+                                                ush::CodePage::UTF8),
                   ush::string_cast<std::string>(physicalPath, ush::CodePage::UTF8),
                   destPath.string());
             } else {
@@ -1456,18 +1512,12 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
                 "NtCreateFile: Failed to create directories for overwrite: {} (dest: "
                 "{})",
                 ush::string_cast<std::string>(
-                    ush::string_cast<std::wstring>(ec.message(), ush::CodePage::UTF8),
+                    ush::string_cast<std::wstring>(ec.message(), ush::CodePage::LOCAL),
                     ush::CodePage::UTF8),
                 ush::string_cast<std::string>(overwriteDirW, ush::CodePage::UTF8));
           }
         }
       }
-    } else if (isInModsDir && !isExcluded && isWrite) {
-      // File is in mods directory and has write access, prepare for CoW
-      logger->debug("NtCreateFile: write access detected for file: {}",
-                    ush::string_cast<std::string>(physicalPath, ush::CodePage::UTF8));
-      WRITE_CONTEXT()->customData<WriteAccessHandleMap>(
-          WriteAccessHandles)[*FileHandle] = {nullptr, physicalPath};
     }
 
     if (!overwriteRedirectPath.empty()) {
@@ -1507,6 +1557,15 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
         // store the original search path for use during iteration
         WRITE_CONTEXT()->customData<SearchHandleMap>(SearchHandles)[*FileHandle] =
             inPathW;
+      }
+
+      // Register write access tracking AFTER successful file creation when we have a
+      // valid handle
+      if (isInModsDir && !isExcluded && !isDestructive && isWrite) {
+        logger->debug("NtCreateFile: write access detected for file: {}",
+                      ush::string_cast<std::string>(physicalPath, ush::CodePage::UTF8));
+        WRITE_CONTEXT()->customData<WriteAccessHandleMap>(
+            WriteAccessHandles)[*FileHandle] = {INVALID_HANDLE_VALUE, physicalPath};
       }
     }
 
@@ -1597,8 +1656,11 @@ NTSTATUS WINAPI usvfs::hook_NtClose(HANDLE Handle)
       WRITE_CONTEXT()->customData<WriteAccessHandleMap>(WriteAccessHandles);
   auto writeIter = writeAccessHandles.find(Handle);
   if (writeIter != writeAccessHandles.end()) {
-    if (writeIter->second.RerouteHandle != nullptr)
-      ::CloseHandle(writeIter->second.RerouteHandle);
+    if (writeIter->second.RerouteHandle != INVALID_HANDLE_VALUE) {
+      spdlog::get("hooks")->debug("NtClose: CoW - Closing reroute file: {}",
+                                  writeIter->second.ReroutePath);
+      ::NtClose(writeIter->second.RerouteHandle);
+    }
     writeAccessHandles.erase(writeIter);
   }
 
@@ -1755,7 +1817,7 @@ NTSTATUS WINAPI usvfs::hook_NtReadFile(HANDLE FileHandle, HANDLE Event,
 
   auto writeIter = writeAccessMap.find(FileHandle);
   if (writeIter != writeAccessMap.end()) {
-    if (writeIter->second.RerouteHandle != nullptr) {
+    if (writeIter->second.RerouteHandle != INVALID_HANDLE_VALUE) {
       // File has been copied, read from the rerouted file
       logger->debug("NtReadFile: Reading from rerouted file: {}",
                     writeIter->second.ReroutePath);
@@ -1811,14 +1873,14 @@ NTSTATUS WINAPI usvfs::hook_NtWriteFile(HANDLE FileHandle, HANDLE Event,
   if (writeIter != writeAccessMap.end()) {
     // handle write access
     WriteAccessHandle& writeAccessInfo = writeIter->second;
-    if (writeAccessInfo.RerouteHandle != nullptr) {
+    if (writeAccessInfo.RerouteHandle != INVALID_HANDLE_VALUE) {
       logger->debug("NtWriteFile: Write operation detected for file: {}",
                     writeAccessInfo.ReroutePath);
       PRE_REALCALL
       res = ::NtWriteFile(writeAccessInfo.RerouteHandle, Event, ApcRoutine, ApcContext,
                           IoStatusBlock, Buffer, Length, ByteOffset, Key);
       POST_REALCALL
-    } else if (writeAccessInfo.RerouteHandle == nullptr) {
+    } else if (writeAccessInfo.RerouteHandle == INVALID_HANDLE_VALUE) {
       logger->info("NtWriteFile: Copy on Write for file: {}",
                    writeAccessInfo.ReroutePath);
 
@@ -1862,10 +1924,30 @@ NTSTATUS WINAPI usvfs::hook_NtWriteFile(HANDLE FileHandle, HANDLE Event,
                              destPath.string());
                 reroutePath = destPath.wstring();
 
-                // Open the rerouted file for writing
-                HANDLE rerouteHandle =
-                    CreateFileW(reroutePath.c_str(), GENERIC_WRITE, 0, nullptr,
-                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                FILE_POSITION_INFORMATION FilePointer;
+                IO_STATUS_BLOCK iosbQuery, iosbSet;
+                HANDLE rerouteHandle = INVALID_HANDLE_VALUE;
+                NTSTATUS queryStatus = ::NtQueryInformationFile(
+                    FileHandle, &iosbQuery, &FilePointer, sizeof(FilePointer),
+                    FilePositionInformation);
+
+                if (queryStatus == STATUS_SUCCESS) {
+                  rerouteHandle =
+                      CreateFileW(reroutePath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                  if (rerouteHandle != INVALID_HANDLE_VALUE) {
+                    NTSTATUS setStatus = ::NtSetInformationFile(
+                        rerouteHandle, &iosbSet, &FilePointer, sizeof(FilePointer),
+                        FilePositionInformation);
+                    if (setStatus != STATUS_SUCCESS) {
+                      logger->error("NtWriteFile: CoW - Failed to set file pointer for "
+                                    "rerouted file: {}",
+                                    reroutePath);
+                      CloseHandle(rerouteHandle);
+                      rerouteHandle = INVALID_HANDLE_VALUE;
+                    }
+                  }
+                }
 
                 if (rerouteHandle != INVALID_HANDLE_VALUE) {
                   writeAccessInfo.RerouteHandle = rerouteHandle;
@@ -1880,13 +1962,18 @@ NTSTATUS WINAPI usvfs::hook_NtWriteFile(HANDLE FileHandle, HANDLE Event,
                   res = STATUS_CANNOT_DELETE;
                 }
               } else {
-                logger->error("NtWriteFile: CoW - Failed to copy file: {}",
-                              ec.message());
+                std::wstring errorMsgW = ush::string_cast<std::wstring>(
+                    ush::string_cast<std::wstring>(ec.message(), ush::CodePage::LOCAL),
+                    ush::CodePage::UTF8);
+                logger->error("NtWriteFile: CoW - Failed to copy file: {}", errorMsgW);
                 res = STATUS_CANNOT_DELETE;
               }
             } else {
+              std::wstring errorMsgW = ush::string_cast<std::wstring>(
+                  ush::string_cast<std::wstring>(ec.message(), ush::CodePage::LOCAL),
+                  ush::CodePage::UTF8);
               logger->error("NtWriteFile: CoW - Failed to create directories: {}",
-                            ec.message());
+                            errorMsgW);
               res = STATUS_CANNOT_DELETE;
             }
           } else {
