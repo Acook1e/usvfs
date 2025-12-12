@@ -297,38 +297,57 @@ BOOL WINAPI usvfs::hook_CreateProcessInternalW(
   }
 
   std::wstring cmdline;
+  bool useCmdline = false;
   if (cend && cmdReroute.fileName()) {
-    auto fileName = cmdReroute.fileName();
-    cmdline.reserve(wcslen(fileName) + wcslen(cend) + 2);
-    if (*fileName != '"')
+    std::wstring fileName = cmdReroute.fileName();
+    if (fileName.length() >= 4 && fileName.compare(0, 4, L"\\\\?\\") == 0) {
+      fileName = fileName.substr(4);
+    } else if (fileName.length() >= 4 && fileName.compare(0, 4, L"\\??\\") == 0) {
+      fileName = fileName.substr(4);
+    }
+
+    cmdline.reserve(fileName.length() + wcslen(cend) + 2);
+    if (fileName.length() > 0 && fileName[0] != '"')
       cmdline += L"\"";
     cmdline += fileName;
-    if (*fileName != '"')
+    if (fileName.length() > 0 && fileName[0] != '"')
       cmdline += L"\"";
     cmdline += cend;
+    useCmdline = true;
+  } else if (lpCommandLine) {
+    cmdline    = lpCommandLine;
+    useCmdline = true;
   }
 
-  if (!cmdline.empty()) {
-    // remove \??\  or \\?\ prefix added by RerouteW for CreateProcess
-    auto pos = cmdline.find(L"\\??\\");
-    while (pos != std::wstring::npos) {
-      cmdline = cmdline.replace(pos, 4, L"");
-      pos     = cmdline.find(L"\\??\\");
+  if (useCmdline) {
+    size_t pos = 0;
+    while ((pos = cmdline.find(L"\\\\?\\", pos)) != std::wstring::npos) {
+      cmdline.replace(pos, 4, L"");
     }
-    pos = cmdline.find(L"\\\\?\\");
-    while (pos != std::wstring::npos) {
-      cmdline = cmdline.replace(pos, 4, L"");
-      pos     = cmdline.find(L"\\\\?\\");
+    pos = 0;
+    while ((pos = cmdline.find(L"\\??\\", pos)) != std::wstring::npos) {
+      cmdline.replace(pos, 4, L"");
     }
   }
 
-  spdlog::get("hooks")->info(
-      "CreateProcessInternalW: application='{}', commandline='{}'",
-      applicationReroute.fileName(), cmdline.empty() ? lpCommandLine : cmdline);
+  std::wstring appName;
+  LPCWSTR lpAppName = applicationReroute.fileName();
+  if (lpAppName) {
+    if (wcsncmp(lpAppName, L"\\\\?\\", 4) == 0) {
+      appName   = lpAppName + 4;
+      lpAppName = appName.c_str();
+    } else if (wcsncmp(lpAppName, L"\\??\\", 4) == 0) {
+      appName   = lpAppName + 4;
+      lpAppName = appName.c_str();
+    }
+  }
+
+  spdlog::get("hooks")->info("CreateProcessInternalW: app={}, cmd={}",
+                             lpAppName ? string_cast<std::string>(lpAppName) : "null",
+                             useCmdline ? string_cast<std::string>(cmdline) : "null");
 
   PRE_REALCALL
-  res = CreateProcessInternalW(token, applicationReroute.fileName(),
-                               cmdline.empty() ? lpCommandLine : &cmdline[0],
+  res = CreateProcessInternalW(token, lpAppName, useCmdline ? &cmdline[0] : nullptr,
                                lpProcessAttributes, lpThreadAttributes, bInheritHandles,
                                dwCreationFlags, lpEnvironment, lpCurrentDirectory,
                                lpStartupInfo, lpProcessInformation, newToken);
@@ -639,20 +658,20 @@ BOOL WINAPI usvfs::hook_DeleteFileW(LPCWSTR lpFileName)
           "DeleteFileW: CoW - Remove mapping instead of deleting file: {}",
           physicalPath);
       reroute.removeMapping(READ_CONTEXT(), false);
-      return true;
+      res = true;
     }
-  }
-
-  PRE_REALCALL
-  if (reroute.wasRerouted()) {
-    res = ::DeleteFileW(reroute.fileName());
   } else {
-    res = ::DeleteFileW(path.c_str());
-  }
-  POST_REALCALL
+    PRE_REALCALL
+    if (reroute.wasRerouted()) {
+      res = ::DeleteFileW(reroute.fileName());
+    } else {
+      res = ::DeleteFileW(path.c_str());
+    }
+    POST_REALCALL
 
-  if (res) {
-    reroute.removeMapping(READ_CONTEXT());
+    if (res) {
+      reroute.removeMapping(READ_CONTEXT());
+    }
   }
 
   if (reroute.wasRerouted())
