@@ -1420,9 +1420,6 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
         (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
                           FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES)) != 0;
 
-    logger->debug("NtCreateFile: isWrite: {}, isDestructive: {}", isWrite,
-                  isDestructive);
-
     std::wstring overwriteRedirectPath;
 
     // Check if file is in mods directory
@@ -1460,9 +1457,6 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
         }
       }
     }
-
-    logger->debug("NtCreateFile: isInModsDir: {}, isExcluded: {}", isInModsDir,
-                  isExcluded);
 
     // Handle destructive operations on mods files
     if (isInModsDir && !isExcluded && isDestructive) {

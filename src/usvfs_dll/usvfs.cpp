@@ -389,6 +389,8 @@ void LoadSettings()
   }
   iniPath += L"usvfs_redirect.ini";
 
+  auto logger = spdlog::get("usvfs");
+
   std::filesystem::path dllDir = std::filesystem::path(modulePath).parent_path();
 
   auto makeAbsolute = [&](std::string pathStr) -> std::string {
@@ -411,7 +413,8 @@ void LoadSettings()
     return ush::string_cast<std::string>(buffer, ush::CodePage::UTF8);
   };
 
-  usvfs::settings::mods_dir = makeAbsolute(readString(L"General", L"mods_dir", L""));
+  usvfs::settings::enableCoW = readString(L"General", L"enable_cow", L"1") != "0";
+  usvfs::settings::mods_dir  = makeAbsolute(readString(L"General", L"mods_dir", L""));
   usvfs::settings::overwrite_dir =
       makeAbsolute(readString(L"General", L"overwrite_dir", L""));
 
@@ -420,7 +423,7 @@ void LoadSettings()
   if (!exclude_raw.empty()) {
     std::stringstream ss(exclude_raw);
     std::string item;
-    while (std::getline(ss, item, ';')) {
+    while (std::getline(ss, item, '|')) {
       if (!item.empty()) {
         std::filesystem::path p =
             ush::string_cast<std::wstring>(item, ush::CodePage::UTF8);
@@ -470,18 +473,16 @@ void LoadSettings()
         usvfs::settings::overwrite_dir     = ush::string_cast<std::string>(
             newOverwrite.lexically_normal().wstring(), ush::CodePage::UTF8);
 
-        auto logger = spdlog::get("usvfs");
-        if (logger) {
-          logger->info("Instance match: '{}' -> Overwrite set to: '{}'",
-                       usvfs::settings::current_process,
-                       usvfs::settings::overwrite_dir);
-        }
+        logger->info("Instance match: '{}' -> Overwrite set to: '{}'",
+                     usvfs::settings::current_process, usvfs::settings::overwrite_dir);
       }
     }
   }
+  usvfs::settings::exclude_mods.push_back(usvfs::settings::overwrite_dir);
 
-  auto logger = spdlog::get("usvfs");
   logger->info("Settings loaded:");
+  logger->info("  enable_cow: {}", usvfs::settings::enableCoW);
+  logger->info("  current_process: {}", usvfs::settings::current_process);
   logger->info("  mods_dir: {}", usvfs::settings::mods_dir);
   logger->info("  overwrite_dir: {}", usvfs::settings::overwrite_dir);
   logger->info("  exclude_mods:");
@@ -500,7 +501,9 @@ void __cdecl InitHooks(LPVOID parameters, size_t)
 
   const usvfsParameters* params = reinterpret_cast<usvfsParameters*>(parameters);
 
-  usvfs::settings::current_process = "SkyrimSE.exe";
+  // get process name from path
+  usvfs::settings::current_process =
+      bfs::path(winapi::ansi::getModuleFileName(nullptr)).filename().string();
   LoadSettings();
 
   // there is already a wait in the constructor of HookManager, but this one is useful

@@ -358,10 +358,11 @@ public:
 
   static fs::path absolutePath(const wchar_t* inPath)
   {
+    fs::path p;
     if (shared::startswith(inPath, LR"(\\?\)") ||
         shared::startswith(inPath, LR"(\??\)")) {
       inPath += 4;
-      return inPath;
+      p = inPath;
     } else if ((shared::startswith(inPath, LR"(\\localhost\)") ||
                 shared::startswith(inPath, LR"(\\127.0.0.1\)")) &&
                inPath[13] == L'$') {
@@ -369,17 +370,47 @@ public:
       newPath += towupper(inPath[12]);
       newPath += L':';
       newPath += &inPath[14];
-      return newPath;
+      p = newPath;
     } else if (inPath[0] == L'\0' || inPath[1] == L':') {
-      return inPath;
+      p = inPath;
     } else if (inPath[0] == L'\\' || inPath[0] == L'/') {
-      return fs::path(winapi::wide::getFullPathName(inPath).first);
+      p = fs::path(winapi::wide::getFullPathName(inPath).first);
+    } else {
+      WCHAR currentDirectory[MAX_PATH];
+      ::GetCurrentDirectoryW(MAX_PATH, currentDirectory);
+      p = fs::path(currentDirectory) / inPath;
     }
-    WCHAR currentDirectory[MAX_PATH];
-    ::GetCurrentDirectoryW(MAX_PATH, currentDirectory);
-    fs::path finalPath = fs::path(currentDirectory) / inPath;
-    return finalPath;
-    // winapi::wide::getFullPathName(inPath).first;
+
+    std::wstring pathStr = p.wstring();
+    if (pathStr.find(L'~') != std::wstring::npos) {
+      std::vector<wchar_t> buffer(MAX_PATH);
+      DWORD res = GetLongPathNameW(pathStr.c_str(), buffer.data(), buffer.size());
+      if (res > buffer.size()) {
+        buffer.resize(res);
+        res = GetLongPathNameW(pathStr.c_str(), buffer.data(), buffer.size());
+      }
+      if (res > 0) {
+        return fs::path(std::wstring(buffer.data(), res));
+      }
+
+      fs::path existing = p;
+      fs::path remainder;
+      while (!existing.empty() && existing != existing.root_path()) {
+        std::wstring eStr = existing.wstring();
+        res = GetLongPathNameW(eStr.c_str(), buffer.data(), buffer.size());
+        if (res > buffer.size()) {
+          buffer.resize(res);
+          res = GetLongPathNameW(eStr.c_str(), buffer.data(), buffer.size());
+        }
+        if (res > 0) {
+          fs::path longExisting(std::wstring(buffer.data(), res));
+          return longExisting / remainder;
+        }
+        remainder = existing.filename() / remainder;
+        existing  = existing.parent_path();
+      }
+    }
+    return p;
   }
 
   static fs::path canonizePath(const fs::path& inPath)
