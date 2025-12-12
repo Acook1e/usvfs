@@ -1201,7 +1201,8 @@ NTSTATUS ntdll_mess_NtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
 
     bool needReroute = false;
     std::wstring physicalPath;
-    if ((DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
+    if (usvfs::settings::enableCoW &&
+        (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
                           FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES)) != 0) {
       physicalPath = adjustedAttributes->ObjectName->Buffer;
 
@@ -1425,7 +1426,8 @@ NTSTATUS ntdll_mess_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     // Check if file is in mods directory
     bool isInModsDir = false;
     std::wstring modsDirW;
-    if (!usvfs::settings::mods_dir.empty() && (isDestructive || isWrite)) {
+    if (usvfs::settings::enableCoW && !usvfs::settings::mods_dir.empty() &&
+        (isDestructive || isWrite)) {
       modsDirW = ush::string_cast<std::wstring>(usvfs::settings::mods_dir,
                                                 ush::CodePage::UTF8);
       if (physicalPath.size() >= modsDirW.size() &&

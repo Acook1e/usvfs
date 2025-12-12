@@ -391,13 +391,12 @@ void LoadSettings()
 
   auto logger = spdlog::get("usvfs");
 
-  std::filesystem::path dllDir = std::filesystem::path(modulePath).parent_path();
+  bfs::path dllDir = bfs::path(modulePath).parent_path();
 
   auto makeAbsolute = [&](std::string pathStr) -> std::string {
     if (pathStr.empty())
       return "";
-    std::filesystem::path p =
-        ush::string_cast<std::wstring>(pathStr, ush::CodePage::UTF8);
+    bfs::path p = ush::string_cast<std::wstring>(pathStr, ush::CodePage::UTF8);
     if (p.is_relative()) {
       p = dllDir / p;
     }
@@ -418,6 +417,15 @@ void LoadSettings()
   usvfs::settings::overwrite_dir =
       makeAbsolute(readString(L"General", L"overwrite_dir", L""));
 
+  if (!bfs::exists(bfs::path(usvfs::settings::mods_dir)) ||
+      !bfs::is_directory(bfs::path(usvfs::settings::mods_dir)))
+    logger->error("Mods directory does not exist or is not a directory: '{}'",
+                  usvfs::settings::mods_dir);
+  if (!bfs::exists(bfs::path(usvfs::settings::overwrite_dir)) ||
+      !bfs::is_directory(bfs::path(usvfs::settings::overwrite_dir)))
+    logger->error("Overwrite directory does not exist or is not a directory: '{}'",
+                  usvfs::settings::overwrite_dir);
+
   std::string exclude_raw = readString(L"General", L"exclude_dir", L"");
   usvfs::settings::exclude_mods.clear();
   if (!exclude_raw.empty()) {
@@ -425,18 +433,19 @@ void LoadSettings()
     std::string item;
     while (std::getline(ss, item, '|')) {
       if (!item.empty()) {
-        std::filesystem::path p =
-            ush::string_cast<std::wstring>(item, ush::CodePage::UTF8);
+        bfs::path p = ush::string_cast<std::wstring>(item, ush::CodePage::UTF8);
         if (p.is_relative() && !usvfs::settings::mods_dir.empty()) {
-          std::filesystem::path mods = ush::string_cast<std::wstring>(
-              usvfs::settings::mods_dir, ush::CodePage::UTF8);
-          p = mods / p;
+          bfs::path mods = ush::string_cast<std::wstring>(usvfs::settings::mods_dir,
+                                                          ush::CodePage::UTF8);
+          p              = mods / p;
         } else if (p.is_relative()) {
-          p = std::filesystem::path(
+          p = bfs::path(
               ush::string_cast<std::wstring>(makeAbsolute(item), ush::CodePage::UTF8));
         }
-        usvfs::settings::exclude_mods.push_back(ush::string_cast<std::string>(
-            p.lexically_normal().wstring(), ush::CodePage::UTF8));
+        // only add if directory exists
+        if (bfs::exists(p) && bfs::is_directory(p))
+          usvfs::settings::exclude_mods.push_back(ush::string_cast<std::string>(
+              p.lexically_normal().wstring(), ush::CodePage::UTF8));
       }
     }
   }
@@ -465,16 +474,18 @@ void LoadSettings()
     if (it != usvfs::settings::output_directories.end()) {
       std::string relativeOverwrite = it->second;
       if (!usvfs::settings::mods_dir.empty()) {
-        std::filesystem::path mods(ush::string_cast<std::wstring>(
-            usvfs::settings::mods_dir, ush::CodePage::UTF8));
-        std::filesystem::path rel(
+        bfs::path mods(ush::string_cast<std::wstring>(usvfs::settings::mods_dir,
+                                                      ush::CodePage::UTF8));
+        bfs::path rel(
             ush::string_cast<std::wstring>(relativeOverwrite, ush::CodePage::UTF8));
-        std::filesystem::path newOverwrite = mods / rel;
-        usvfs::settings::overwrite_dir     = ush::string_cast<std::string>(
-            newOverwrite.lexically_normal().wstring(), ush::CodePage::UTF8);
-
-        logger->info("Instance match: '{}' -> Overwrite set to: '{}'",
-                     usvfs::settings::current_process, usvfs::settings::overwrite_dir);
+        bfs::path newOverwrite = mods / rel;
+        if (bfs::exists(newOverwrite) && bfs::is_directory(newOverwrite)) {
+          usvfs::settings::overwrite_dir = ush::string_cast<std::string>(
+              newOverwrite.lexically_normal().wstring(), ush::CodePage::UTF8);
+          logger->info("Instance match: '{}' -> Overwrite set to: '{}'",
+                       usvfs::settings::current_process,
+                       usvfs::settings::overwrite_dir);
+        }
       }
     }
   }
