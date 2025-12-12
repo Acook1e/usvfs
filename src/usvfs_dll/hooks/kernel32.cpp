@@ -660,18 +660,18 @@ BOOL WINAPI usvfs::hook_DeleteFileW(LPCWSTR lpFileName)
       reroute.removeMapping(READ_CONTEXT(), false);
       res = true;
     }
-  } else {
-    PRE_REALCALL
-    if (reroute.wasRerouted()) {
-      res = ::DeleteFileW(reroute.fileName());
-    } else {
-      res = ::DeleteFileW(path.c_str());
-    }
-    POST_REALCALL
+  }
 
-    if (res) {
-      reroute.removeMapping(READ_CONTEXT());
-    }
+  PRE_REALCALL
+  if (reroute.wasRerouted()) {
+    res = ::DeleteFileW(reroute.fileName());
+  } else {
+    res = ::DeleteFileW(path.c_str());
+  }
+  POST_REALCALL
+
+  if (res) {
+    reroute.removeMapping(READ_CONTEXT());
   }
 
   if (reroute.wasRerouted())
